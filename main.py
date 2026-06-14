@@ -92,7 +92,7 @@ class RecipientData(BaseModel):
 class MatchRequest(BaseModel):
     donor: DonorData
     recipients: list[RecipientData] = Field(..., min_length=1)
-    top_k: int = Field(default=5, ge=1, le=50)
+    top_k: int = Field(default=1, ge=1, le=50)
 
 
 class MatchEntry(BaseModel):
