@@ -16,19 +16,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # في Production: حدد الـ Django server URL
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────
-# In-Memory Results Cache
-# ─────────────────────────────────────────
 results_cache: dict[str, dict] = {}
 
 
 # ─────────────────────────────────────────
-# Pydantic Schemas — بيانات المتبرع والمريض
+# Pydantic Schemas
 # ─────────────────────────────────────────
 
 class DonorData(BaseModel):
@@ -99,9 +96,9 @@ class MatchResponse(BaseModel):
 # ─────────────────────────────────────────
 
 ABO_COMPATIBILITY = {
-    "O":  ["O", "A", "B", "AB"],
-    "A":  ["A", "AB"],
-    "B":  ["B", "AB"],
+    "O": ["O", "A", "B", "AB"],
+    "A": ["A", "AB"],
+    "B": ["B", "AB"],
     "AB": ["AB"],
 }
 
@@ -112,31 +109,23 @@ URGENCY_MAP = {
     "critical": 1.0,
 }
 
-ORGAN_MAPPING = {
-    "kidney":           ["kidney_left", "kidney_right"],
-    "kidney_left":      ["kidney_left"],
-    "kidney_right":     ["kidney_right"],
-    "liver":            ["liver", "liver_lobe"],
-    "liver_lobe":       ["liver_lobe", "liver"],
-    "heart":            ["heart"],
-    "lung_left":        ["lung_left", "lung_lobe"],
-    "lung_right":       ["lung_right", "lung_lobe"],
-    "lung_lobe":        ["lung_left", "lung_right", "lung_lobe"],
-    "pancreas":         ["pancreas", "pancreas_segment"],
-    "pancreas_segment": ["pancreas_segment", "pancreas"],
-}
-
 
 def is_abo_compatible(donor_bt: str, recip_bt: str) -> bool:
-    return recip_bt.strip().upper() in ABO_COMPATIBILITY.get(donor_bt.strip().upper(), [])
+    if pd.isna(donor_bt) or pd.isna(recip_bt):
+        return False
+
+    donor_bt = str(donor_bt).strip().upper()
+    recip_bt = str(recip_bt).strip().upper()
+
+    return recip_bt in ABO_COMPATIBILITY.get(donor_bt, [])
 
 
 def hla_match_score(donor: dict, recip: dict) -> float:
     matches = sum([
-        donor.get("HLA_A_1")  == recip.get("HLA_A_1"),
-        donor.get("HLA_A_2")  == recip.get("HLA_A_2"),
-        donor.get("HLA_B_1")  == recip.get("HLA_B_1"),
-        donor.get("HLA_B_2")  == recip.get("HLA_B_2"),
+        donor.get("HLA_A_1") == recip.get("HLA_A_1"),
+        donor.get("HLA_A_2") == recip.get("HLA_A_2"),
+        donor.get("HLA_B_1") == recip.get("HLA_B_1"),
+        donor.get("HLA_B_2") == recip.get("HLA_B_2"),
         donor.get("HLA_DR_1") == recip.get("HLA_DR_1"),
         donor.get("HLA_DR_2") == recip.get("HLA_DR_2"),
     ])
@@ -144,42 +133,37 @@ def hla_match_score(donor: dict, recip: dict) -> float:
 
 
 def normalize_series(s: pd.Series) -> pd.Series:
-    s = s.astype(float)
-    min_v, max_v = np.nanmin(s), np.nanmax(s)
+    s = pd.to_numeric(s, errors="coerce").fillna(0).astype(float)
+
+    min_v = np.nanmin(s)
+    max_v = np.nanmax(s)
+
     if np.isnan(min_v) or np.isnan(max_v) or max_v == min_v:
         return pd.Series(np.zeros(len(s)), index=s.index)
+
     return (s - min_v) / (max_v - min_v)
 
 
-def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) -> list[dict]:
-    """
-    نفس منطق pro.ipynb بالضبط:
-    1) فلترة العضو Exact Match على donor.organ_type
-    2) فلترة فصيلة الدم ABO
-    3) حساب نفس الـ weights
-    4) ترتيب تنازلي حسب matching_score
+def run_matching(
+    donor: DonorData,
+    recipients: list[RecipientData],
+    top_k: int
+) -> list[dict]:
 
-    ملاحظة:
-    pro.ipynb يعرض matching_score كرقم من 0 إلى 1.
-    الـ API يرجّعه كنسبة مئوية score من 0 إلى 100.
-    """
     donor_dict = donor.model_dump()
-
     donor_bt = donor.blood_type
-    acceptable_organ = str(donor.organ_type).lower()
+    acceptable_organ = str(donor.organ_type).strip().lower()
 
-    # مطابق لـ pro.ipynb:
-    # subset = recipients_data[recipients_data["organ_needed"].str.lower() == acceptable_organ]
+    # 1) Exact organ match زي pro.ipynb
     same_organ = [
         r for r in recipients
-        if str(r.organ_needed).lower() == acceptable_organ
+        if str(r.organ_needed).strip().lower() == acceptable_organ
     ]
 
     if not same_organ:
         return []
 
-    # مطابق لـ pro.ipynb:
-    # mask_abo = subset["blood_type"].apply(lambda bt: is_abo_compatible(donor_bt, bt))
+    # 2) ABO filter زي pro.ipynb
     filtered = [
         r for r in same_organ
         if is_abo_compatible(donor_bt, r.blood_type)
@@ -190,7 +174,7 @@ def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) 
 
     df = pd.DataFrame([r.model_dump() for r in filtered])
 
-    # ── Scores مطابقين لـ compute_matching_scores_for_subset في pro.ipynb ──
+    # 3) Scores
     abo_scores = np.ones(len(df))
 
     hla_scores = np.array([
@@ -198,51 +182,48 @@ def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) 
         for r in df.to_dict("records")
     ])
 
-    pra = df["PRA"].fillna(100).astype(float)
+    pra = pd.to_numeric(df["PRA"], errors="coerce").fillna(100).astype(float)
     immuno_scores = (1.0 - (pra / 100.0)).clip(0.0, 1.0).values
 
     urgency_scores = df["urgency_level"].apply(
-        lambda u: URGENCY_MAP.get(str(u).lower(), 0.0)
+        lambda u: URGENCY_MAP.get(str(u).strip().lower(), 0.0)
     ).values
 
     wait_norm = normalize_series(df["waitlist_time_days"]).values
 
-    organ = str(donor.organ_type).lower()
+    organ = acceptable_organ
     organ_specific_scores = np.zeros(len(df))
 
     if organ in ["kidney", "kidney_left", "kidney_right"]:
         organ_specific_scores = normalize_series(
-            df["dialysis_duration_days"].fillna(0)
+            df["dialysis_duration_days"]
         ).values
 
     elif organ in ["liver", "liver_lobe"]:
         organ_specific_scores = normalize_series(
-            df["MELD_score"].fillna(0)
+            df["MELD_score"]
         ).values
 
     elif "lung" in organ:
         organ_specific_scores = normalize_series(
-            df["lung_severity_score"].fillna(0)
+            df["lung_severity_score"]
         ).values
 
-    W_HLA = 0.35
-    W_ABO = 0.20
-    W_IMMUNO = 0.10
-    W_URGENCY = 0.15
-    W_WAIT = 0.10
-    W_ORGAN_SPEC = 0.10
-
     total_score = (
-        W_HLA * hla_scores +
-        W_ABO * abo_scores +
-        W_IMMUNO * immuno_scores +
-        W_URGENCY * urgency_scores +
-        W_WAIT * wait_norm +
-        W_ORGAN_SPEC * organ_specific_scores
+        0.35 * hla_scores +
+        0.20 * abo_scores +
+        0.10 * immuno_scores +
+        0.15 * urgency_scores +
+        0.10 * wait_norm +
+        0.10 * organ_specific_scores
     )
 
     df["matching_score"] = total_score
-    top = df.sort_values("matching_score", ascending=False).head(top_k)
+
+    top = df.sort_values(
+        "matching_score",
+        ascending=False
+    ).head(top_k)
 
     return [
         {
@@ -266,7 +247,6 @@ def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) 
 def trigger_matching(req: MatchRequest):
     matches = run_matching(req.donor, req.recipients, req.top_k)
 
-    # احفظ النتائج في الـ cache لجلبها لاحقاً بـ GET
     results_cache[req.donor.donor_id] = {
         "donor_id": req.donor.donor_id,
         "top_matches": matches,
@@ -286,21 +266,22 @@ def trigger_matching(req: MatchRequest):
 )
 def get_matching_results(donor_id: str):
     result = results_cache.get(donor_id)
+
     if not result:
         raise HTTPException(
             status_code=404,
             detail=f"No results found for donor '{donor_id}'. Run POST /api/matching/ first.",
         )
+
     return MatchResponse(
         donor_id=donor_id,
         top_matches=[MatchEntry(**m) for m in result["top_matches"]],
     )
 
 
-# ─────────────────────────────────────────
-# Health Check
-# ─────────────────────────────────────────
-
 @app.get("/health", tags=["System"])
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "version": "2.0.0"
+    }
