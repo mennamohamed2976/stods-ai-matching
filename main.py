@@ -1,14 +1,3 @@
-"""
-Organ Matching 
-
-كل البيانات بتيجي من الـ Django Backend
- في الـ Request.
-
-Endpoints:
-  POST /api/matching/           → يستقبل بيانات المتبرع + المرضى ويرجع النتائج فوراً
-  GET  /api/matching/{donor_id} → جلب آخر نتائج محفوظة لمتبرع معين
-"""
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -92,7 +81,7 @@ class RecipientData(BaseModel):
 class MatchRequest(BaseModel):
     donor: DonorData
     recipients: list[RecipientData] = Field(..., min_length=1)
-    top_k: int = Field(default=1, ge=1, le=50)
+    top_k: int = Field(default=5, ge=1, le=50)
 
 
 class MatchEntry(BaseModel):
@@ -163,14 +152,37 @@ def normalize_series(s: pd.Series) -> pd.Series:
 
 
 def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) -> list[dict]:
-    donor_dict = donor.model_dump()
-    acceptable_organs = ORGAN_MAPPING.get(donor.organ_type.lower(), [])
+    """
+    نفس منطق pro.ipynb بالضبط:
+    1) فلترة العضو Exact Match على donor.organ_type
+    2) فلترة فصيلة الدم ABO
+    3) حساب نفس الـ weights
+    4) ترتيب تنازلي حسب matching_score
 
-    # فلترة المرضى: العضو + فصيلة الدم
-    filtered = [
+    ملاحظة:
+    pro.ipynb يعرض matching_score كرقم من 0 إلى 1.
+    الـ API يرجّعه كنسبة مئوية score من 0 إلى 100.
+    """
+    donor_dict = donor.model_dump()
+
+    donor_bt = donor.blood_type
+    acceptable_organ = str(donor.organ_type).lower()
+
+    # مطابق لـ pro.ipynb:
+    # subset = recipients_data[recipients_data["organ_needed"].str.lower() == acceptable_organ]
+    same_organ = [
         r for r in recipients
-        if r.organ_needed.lower() in acceptable_organs
-        and is_abo_compatible(donor.blood_type, r.blood_type)
+        if str(r.organ_needed).lower() == acceptable_organ
+    ]
+
+    if not same_organ:
+        return []
+
+    # مطابق لـ pro.ipynb:
+    # mask_abo = subset["blood_type"].apply(lambda bt: is_abo_compatible(donor_bt, bt))
+    filtered = [
+        r for r in same_organ
+        if is_abo_compatible(donor_bt, r.blood_type)
     ]
 
     if not filtered:
@@ -178,34 +190,58 @@ def run_matching(donor: DonorData, recipients: list[RecipientData], top_k: int) 
 
     df = pd.DataFrame([r.model_dump() for r in filtered])
 
-    # ── الـ Scores ──
-    hla_scores     = np.array([hla_match_score(donor_dict, r) for r in df.to_dict("records")])
-    abo_scores     = np.ones(len(df))
-    immuno_scores  = (1.0 - df["PRA"].fillna(100).astype(float) / 100.0).clip(0, 1).values
+    # ── Scores مطابقين لـ compute_matching_scores_for_subset في pro.ipynb ──
+    abo_scores = np.ones(len(df))
+
+    hla_scores = np.array([
+        hla_match_score(donor_dict, r)
+        for r in df.to_dict("records")
+    ])
+
+    pra = df["PRA"].fillna(100).astype(float)
+    immuno_scores = (1.0 - (pra / 100.0)).clip(0.0, 1.0).values
+
     urgency_scores = df["urgency_level"].apply(
         lambda u: URGENCY_MAP.get(str(u).lower(), 0.0)
     ).values
-    wait_norm      = normalize_series(df["waitlist_time_days"]).values
 
-    organ = donor.organ_type.lower()
-    organ_specific = np.zeros(len(df))
+    wait_norm = normalize_series(df["waitlist_time_days"]).values
+
+    organ = str(donor.organ_type).lower()
+    organ_specific_scores = np.zeros(len(df))
+
     if organ in ["kidney", "kidney_left", "kidney_right"]:
-        organ_specific = normalize_series(df["dialysis_duration_days"].fillna(0)).values
-    elif organ in ["liver", "liver_lobe"]:
-        organ_specific = normalize_series(df["MELD_score"].fillna(0)).values
-    elif "lung" in organ:
-        organ_specific = normalize_series(df["lung_severity_score"].fillna(0)).values
+        organ_specific_scores = normalize_series(
+            df["dialysis_duration_days"].fillna(0)
+        ).values
 
-    total = (
-        0.35 * hla_scores +
-        0.20 * abo_scores +
-        0.10 * immuno_scores +
-        0.15 * urgency_scores +
-        0.10 * wait_norm +
-        0.10 * organ_specific
+    elif organ in ["liver", "liver_lobe"]:
+        organ_specific_scores = normalize_series(
+            df["MELD_score"].fillna(0)
+        ).values
+
+    elif "lung" in organ:
+        organ_specific_scores = normalize_series(
+            df["lung_severity_score"].fillna(0)
+        ).values
+
+    W_HLA = 0.35
+    W_ABO = 0.20
+    W_IMMUNO = 0.10
+    W_URGENCY = 0.15
+    W_WAIT = 0.10
+    W_ORGAN_SPEC = 0.10
+
+    total_score = (
+        W_HLA * hla_scores +
+        W_ABO * abo_scores +
+        W_IMMUNO * immuno_scores +
+        W_URGENCY * urgency_scores +
+        W_WAIT * wait_norm +
+        W_ORGAN_SPEC * organ_specific_scores
     )
 
-    df["matching_score"] = total
+    df["matching_score"] = total_score
     top = df.sort_values("matching_score", ascending=False).head(top_k)
 
     return [
